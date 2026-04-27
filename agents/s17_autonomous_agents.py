@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # Harness: autonomy -- models that find work without being told.
 """
-s11_autonomous_agents.py - Autonomous Agents
-
+s17_autonomous_agents.py - Autonomous Agents
 Idle cycle with task board polling, auto-claiming unclaimed tasks, and
-identity re-injection after context compression. Builds on s10's protocols.
-
+identity re-injection after context compression. Builds on task boards,
+team mailboxes, and protocol support from earlier chapters.
     Teammate lifecycle:
     +-------+
     | spawn |
@@ -27,14 +26,14 @@ identity re-injection after context compression. Builds on s10's protocols.
         +---> scan .tasks/ -> unclaimed? -> claim -> resume WORK
         |
         +---> timeout (60s) -> shutdown
-
     Identity re-injection after compression:
     messages = [identity_block, ...remaining...]
     "You are 'coder', role: backend, team: my-team"
-
-Key insight: "The agent finds work itself."
+Key idea: an idle teammate can safely claim ready work instead of waiting
+for every assignment from the lead.
+A teammate here is a long-lived worker, not a one-shot subagent that only
+returns a single summary.
 """
-
 import json
 import os
 import subprocess
@@ -43,38 +42,90 @@ import time
 import uuid
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
+
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is required")
+
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
+
 MODEL = os.environ["MODEL_ID"]
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 TASKS_DIR = WORKDIR / ".tasks"
-
+REQUESTS_DIR = TEAM_DIR / "requests"
+CLAIM_EVENTS_PATH = TASKS_DIR / "claim_events.jsonl"
 POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
-
 SYSTEM = f"You are a team lead at {WORKDIR}. Teammates are autonomous -- they find work themselves."
-
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
     "shutdown_request",
     "shutdown_response",
+    "plan_approval",
     "plan_approval_response",
 }
-
-# -- Request trackers --
-shutdown_requests = {}
-plan_requests = {}
-_tracker_lock = threading.Lock()
 _claim_lock = threading.Lock()
+
+
+def _function_tool(name: str, description: str, properties: dict, required: list | None = None) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required or [],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _assistant_message_with_tool_calls(message) -> dict:
+    tool_calls = []
+    for call in message.tool_calls or []:
+        tool_calls.append(
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments or "{}",
+                },
+            }
+        )
+
+    payload = {
+        "role": "assistant",
+        "content": message.content or "",
+    }
+    if tool_calls:
+        payload["tool_calls"] = tool_calls
+    return payload
+
+
+def _parse_tool_args(raw_args: str) -> tuple[dict | None, str | None]:
+    try:
+        data = json.loads(raw_args or "{}")
+    except json.JSONDecodeError as exc:
+        return None, f"Error: Invalid JSON arguments ({exc})"
+    if not isinstance(data, dict):
+        return None, "Error: Tool arguments must be a JSON object"
+    return data, None
 
 
 # -- MessageBus: JSONL inbox per teammate --
@@ -82,7 +133,6 @@ class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)
-
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
         if msg_type not in VALID_MSG_TYPES:
@@ -99,7 +149,6 @@ class MessageBus:
         with open(inbox_path, "a") as f:
             f.write(json.dumps(msg) + "\n")
         return f"Sent {msg_type} to {to}"
-
     def read_inbox(self, name: str) -> list:
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
@@ -110,7 +159,6 @@ class MessageBus:
                 messages.append(json.loads(line))
         inbox_path.write_text("")
         return messages
-
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
         count = 0
         for name in teammates:
@@ -118,52 +166,102 @@ class MessageBus:
                 self.send(sender, name, content, "broadcast")
                 count += 1
         return f"Broadcast to {count} teammates"
-
-
 BUS = MessageBus(INBOX_DIR)
-
-
+class RequestStore:
+    """
+    Durable protocol request records.
+    s17 should not regress from s16 back to in-memory trackers. These request
+    files let autonomous teammates inspect or resume protocol state later.
+    """
+    def __init__(self, base_dir: Path):
+        self.dir = base_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+    def _path(self, request_id: str) -> Path:
+        return self.dir / f"{request_id}.json"
+    def create(self, record: dict) -> dict:
+        request_id = record["request_id"]
+        with self._lock:
+            self._path(request_id).write_text(json.dumps(record, indent=2))
+        return record
+    def get(self, request_id: str) -> dict | None:
+        path = self._path(request_id)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+    def update(self, request_id: str, **changes) -> dict | None:
+        with self._lock:
+            record = self.get(request_id)
+            if not record:
+                return None
+            record.update(changes)
+            record["updated_at"] = time.time()
+            self._path(request_id).write_text(json.dumps(record, indent=2))
+        return record
+REQUEST_STORE = RequestStore(REQUESTS_DIR)
 # -- Task board scanning --
-def scan_unclaimed_tasks() -> list:
+def _append_claim_event(payload: dict):
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    with CLAIM_EVENTS_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload) + "\n")
+def _task_allows_role(task: dict, role: str | None) -> bool:
+    required_role = task.get("claim_role") or task.get("required_role") or ""
+    if not required_role:
+        return True
+    return bool(role) and role == required_role
+def is_claimable_task(task: dict, role: str | None = None) -> bool:
+    return (
+        task.get("status") == "pending"
+        and not task.get("owner")
+        and not task.get("blockedBy")
+        and _task_allows_role(task, role)
+    )
+def scan_unclaimed_tasks(role: str | None = None) -> list:
     TASKS_DIR.mkdir(exist_ok=True)
     unclaimed = []
     for f in sorted(TASKS_DIR.glob("task_*.json")):
         task = json.loads(f.read_text())
-        if (task.get("status") == "pending"
-                and not task.get("owner")
-                and not task.get("blockedBy")):
+        if is_claimable_task(task, role):
             unclaimed.append(task)
     return unclaimed
-
-
-def claim_task(task_id: int, owner: str) -> str:
+def claim_task(
+    task_id: int,
+    owner: str,
+    role: str | None = None,
+    source: str = "manual",
+) -> str:
     with _claim_lock:
         path = TASKS_DIR / f"task_{task_id}.json"
         if not path.exists():
             return f"Error: Task {task_id} not found"
         task = json.loads(path.read_text())
-        if task.get("owner"):
-            existing_owner = task.get("owner") or "someone else"
-            return f"Error: Task {task_id} has already been claimed by {existing_owner}"
-        if task.get("status") != "pending":
-            status = task.get("status")
-            return f"Error: Task {task_id} cannot be claimed because its status is '{status}'"
-        if task.get("blockedBy"):
-            return f"Error: Task {task_id} is blocked by other task(s) and cannot be claimed yet"
+        if not is_claimable_task(task, role):
+            return f"Error: Task {task_id} is not claimable for role={role or '(any)'}"
         task["owner"] = owner
         task["status"] = "in_progress"
+        task["claimed_at"] = time.time()
+        task["claim_source"] = source
         path.write_text(json.dumps(task, indent=2))
-    return f"Claimed task #{task_id} for {owner}"
-
-
+    _append_claim_event({
+        "event": "task.claimed",
+        "task_id": task_id,
+        "owner": owner,
+        "role": role,
+        "source": source,
+        "ts": time.time(),
+    })
+    return f"Claimed task #{task_id} for {owner} via {source}"
 # -- Identity re-injection after compression --
 def make_identity_block(name: str, role: str, team_name: str) -> dict:
     return {
         "role": "user",
         "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
     }
-
-
+def ensure_identity_context(messages: list, name: str, role: str, team_name: str):
+    if messages and "<identity>" in str(messages[0].get("content", "")):
+        return
+    messages.insert(0, make_identity_block(name, role, team_name))
+    messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
 # -- Autonomous TeammateManager --
 class TeammateManager:
     def __init__(self, team_dir: Path):
@@ -172,27 +270,22 @@ class TeammateManager:
         self.config_path = self.dir / "config.json"
         self.config = self._load_config()
         self.threads = {}
-
     def _load_config(self) -> dict:
         if self.config_path.exists():
             return json.loads(self.config_path.read_text())
         return {"team_name": "default", "members": []}
-
     def _save_config(self):
         self.config_path.write_text(json.dumps(self.config, indent=2))
-
     def _find_member(self, name: str) -> dict:
         for m in self.config["members"]:
             if m["name"] == name:
                 return m
         return None
-
     def _set_status(self, name: str, status: str):
         member = self._find_member(name)
         if member:
             member["status"] = status
             self._save_config()
-
     def spawn(self, name: str, role: str, prompt: str) -> str:
         member = self._find_member(name)
         if member:
@@ -212,7 +305,6 @@ class TeammateManager:
         self.threads[name] = thread
         thread.start()
         return f"Spawned '{name}' (role: {role})"
-
     def _loop(self, name: str, role: str, prompt: str):
         team_name = self.config["team_name"]
         sys_prompt = (
@@ -232,35 +324,41 @@ class TeammateManager:
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
                 try:
-                    response = client.messages.create(
+                    # 关键请求点：统一走 OpenAI chat-completions 形态。
+                    response = client.chat.completions.create(
                         model=MODEL,
-                        system=sys_prompt,
-                        messages=messages,
+                        messages=[{"role": "system", "content": sys_prompt}, *messages],
                         tools=tools,
                         max_tokens=8000,
                     )
                 except Exception:
                     self._set_status(name, "idle")
                     return
-                messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
+
+                assistant = response.choices[0].message
+                messages.append(_assistant_message_with_tool_calls(assistant))
+                if not assistant.tool_calls:
                     break
-                results = []
+
                 idle_requested = False
-                for block in response.content:
-                    if block.type == "tool_use":
-                        if block.name == "idle":
-                            idle_requested = True
-                            output = "Entering idle phase. Will poll for new tasks."
-                        else:
-                            output = self._exec(name, block.name, block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                        results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": str(output),
-                        })
-                messages.append({"role": "user", "content": results})
+                for call in assistant.tool_calls:
+                    # 关键容错点：工具参数来自模型文本，先做 JSON 解析校验。
+                    parsed_args, parse_error = _parse_tool_args(call.function.arguments)
+                    if parse_error:
+                        output = parse_error
+                    elif call.function.name == "idle":
+                        idle_requested = True
+                        output = "Entering idle phase. Will poll for new tasks."
+                    else:
+                        output = self._exec(name, call.function.name, parsed_args)
+
+                    print(f"  [{name}] {call.function.name}: {str(output)[:120]}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": str(output),
+                    })
+
                 if idle_requested:
                     break
 
@@ -272,6 +370,7 @@ class TeammateManager:
                 time.sleep(POLL_INTERVAL)
                 inbox = BUS.read_inbox(name)
                 if inbox:
+                    ensure_identity_context(messages, name, role, team_name)
                     for msg in inbox:
                         if msg.get("type") == "shutdown_request":
                             self._set_status(name, "shutdown")
@@ -279,29 +378,27 @@ class TeammateManager:
                         messages.append({"role": "user", "content": json.dumps(msg)})
                     resume = True
                     break
-                unclaimed = scan_unclaimed_tasks()
+                unclaimed = scan_unclaimed_tasks(role)
                 if unclaimed:
                     task = unclaimed[0]
-                    result = claim_task(task["id"], name)
-                    if result.startswith("Error:"):
+                    claim_result = claim_task(
+                        task["id"], name, role=role, source="auto"
+                    )
+                    if claim_result.startswith("Error:"):
                         continue
                     task_prompt = (
                         f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
                         f"{task.get('description', '')}</auto-claimed>"
                     )
-                    if len(messages) <= 3:
-                        messages.insert(0, make_identity_block(name, role, team_name))
-                        messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
+                    ensure_identity_context(messages, name, role, team_name)
                     messages.append({"role": "user", "content": task_prompt})
-                    messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
+                    messages.append({"role": "assistant", "content": f"{claim_result}. Working on it."})
                     resume = True
                     break
-
             if not resume:
                 self._set_status(name, "shutdown")
                 return
             self._set_status(name, "working")
-
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
         # these base tools are unchanged from s02
         if tool_name == "bash":
@@ -318,9 +415,15 @@ class TeammateManager:
             return json.dumps(BUS.read_inbox(sender), indent=2)
         if tool_name == "shutdown_response":
             req_id = args["request_id"]
-            with _tracker_lock:
-                if req_id in shutdown_requests:
-                    shutdown_requests[req_id]["status"] = "approved" if args["approve"] else "rejected"
+            updated = REQUEST_STORE.update(
+                req_id,
+                status="approved" if args["approve"] else "rejected",
+                resolved_by=sender,
+                resolved_at=time.time(),
+                response={"approve": args["approve"], "reason": args.get("reason", "")},
+            )
+            if not updated:
+                return f"Error: Unknown shutdown request {req_id}"
             BUS.send(
                 sender, "lead", args.get("reason", ""),
                 "shutdown_response", {"request_id": req_id, "approve": args["approve"]},
@@ -329,42 +432,103 @@ class TeammateManager:
         if tool_name == "plan_approval":
             plan_text = args.get("plan", "")
             req_id = str(uuid.uuid4())[:8]
-            with _tracker_lock:
-                plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            REQUEST_STORE.create({
+                "request_id": req_id,
+                "kind": "plan_approval",
+                "from": sender,
+                "to": "lead",
+                "status": "pending",
+                "plan": plan_text,
+                "created_at": time.time(),
+                "updated_at": time.time(),
+            })
             BUS.send(
-                sender, "lead", plan_text, "plan_approval_response",
+                sender, "lead", plan_text, "plan_approval",
                 {"request_id": req_id, "plan": plan_text},
             )
             return f"Plan submitted (request_id={req_id}). Waiting for approval."
         if tool_name == "claim_task":
-            return claim_task(args["task_id"], sender)
+            return claim_task(
+                args["task_id"],
+                sender,
+                role=self._find_member(sender).get("role") if self._find_member(sender) else None,
+                source="manual",
+            )
         return f"Unknown tool: {tool_name}"
-
     def _teammate_tools(self) -> list:
         # these base tools are unchanged from s02
         return [
-            {"name": "bash", "description": "Run a shell command.",
-             "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-            {"name": "read_file", "description": "Read file contents.",
-             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-            {"name": "write_file", "description": "Write content to file.",
-             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-            {"name": "edit_file", "description": "Replace exact text in file.",
-             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-            {"name": "send_message", "description": "Send message to a teammate.",
-             "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
-            {"name": "read_inbox", "description": "Read and drain your inbox.",
-             "input_schema": {"type": "object", "properties": {}}},
-            {"name": "shutdown_response", "description": "Respond to a shutdown request.",
-             "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
-            {"name": "plan_approval", "description": "Submit a plan for lead approval.",
-             "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
-            {"name": "idle", "description": "Signal that you have no more work. Enters idle polling phase.",
-             "input_schema": {"type": "object", "properties": {}}},
-            {"name": "claim_task", "description": "Claim a task from the task board by ID.",
-             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+            _function_tool(
+                "bash",
+                "Run a shell command.",
+                {"command": {"type": "string"}},
+                ["command"],
+            ),
+            _function_tool(
+                "read_file",
+                "Read file contents.",
+                {"path": {"type": "string"}},
+                ["path"],
+            ),
+            _function_tool(
+                "write_file",
+                "Write content to file.",
+                {"path": {"type": "string"}, "content": {"type": "string"}},
+                ["path", "content"],
+            ),
+            _function_tool(
+                "edit_file",
+                "Replace exact text in file.",
+                {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                ["path", "old_text", "new_text"],
+            ),
+            _function_tool(
+                "send_message",
+                "Send message to a teammate.",
+                {
+                    "to": {"type": "string"},
+                    "content": {"type": "string"},
+                    "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)},
+                },
+                ["to", "content"],
+            ),
+            _function_tool(
+                "read_inbox",
+                "Read and drain your inbox.",
+                {},
+            ),
+            _function_tool(
+                "shutdown_response",
+                "Respond to a shutdown request.",
+                {
+                    "request_id": {"type": "string"},
+                    "approve": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                ["request_id", "approve"],
+            ),
+            _function_tool(
+                "plan_approval",
+                "Submit a plan for lead approval.",
+                {"plan": {"type": "string"}},
+                ["plan"],
+            ),
+            _function_tool(
+                "idle",
+                "Signal that you have no more work. Enters idle polling phase.",
+                {},
+            ),
+            _function_tool(
+                "claim_task",
+                "Claim a task from the task board by ID.",
+                {"task_id": {"type": "integer"}},
+                ["task_id"],
+            ),
         ]
-
     def list_all(self) -> str:
         if not self.config["members"]:
             return "No teammates."
@@ -372,22 +536,15 @@ class TeammateManager:
         for m in self.config["members"]:
             lines.append(f"  {m['name']} ({m['role']}): {m['status']}")
         return "\n".join(lines)
-
     def member_names(self) -> list:
         return [m["name"] for m in self.config["members"]]
-
-
 TEAM = TeammateManager(TEAM_DIR)
-
-
 # -- Base tool implementations (these base tools are unchanged from s02) --
 def _safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
-
-
 def _run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot"]
     if any(d in command for d in dangerous):
@@ -401,8 +558,6 @@ def _run_bash(command: str) -> str:
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
-
-
 def _run_read(path: str, limit: int = None) -> str:
     try:
         lines = _safe_path(path).read_text().splitlines()
@@ -411,8 +566,6 @@ def _run_read(path: str, limit: int = None) -> str:
         return "\n".join(lines)[:50000]
     except Exception as e:
         return f"Error: {e}"
-
-
 def _run_write(path: str, content: str) -> str:
     try:
         fp = _safe_path(path)
@@ -421,8 +574,6 @@ def _run_write(path: str, content: str) -> str:
         return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"Error: {e}"
-
-
 def _run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = _safe_path(path)
@@ -433,39 +584,41 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
-
-
 # -- Lead-specific protocol handlers --
 def handle_shutdown_request(teammate: str) -> str:
     req_id = str(uuid.uuid4())[:8]
-    with _tracker_lock:
-        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    REQUEST_STORE.create({
+        "request_id": req_id,
+        "kind": "shutdown",
+        "from": "lead",
+        "to": teammate,
+        "status": "pending",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    })
     BUS.send(
         "lead", teammate, "Please shut down gracefully.",
         "shutdown_request", {"request_id": req_id},
     )
     return f"Shutdown request {req_id} sent to '{teammate}'"
-
-
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
-    with _tracker_lock:
-        req = plan_requests.get(request_id)
+    req = REQUEST_STORE.get(request_id)
     if not req:
         return f"Error: Unknown plan request_id '{request_id}'"
-    with _tracker_lock:
-        req["status"] = "approved" if approve else "rejected"
+    REQUEST_STORE.update(
+        request_id,
+        status="approved" if approve else "rejected",
+        reviewed_by="lead",
+        resolved_at=time.time(),
+        feedback=feedback,
+    )
     BUS.send(
         "lead", req["from"], feedback, "plan_approval_response",
         {"request_id": request_id, "approve": approve, "feedback": feedback},
     )
-    return f"Plan {req['status']} for '{req['from']}'"
-
-
+    return f"Plan {'approved' if approve else 'rejected'} for '{req['from']}'"
 def _check_shutdown_status(request_id: str) -> str:
-    with _tracker_lock:
-        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
-
-
+    return json.dumps(REQUEST_STORE.get(request_id) or {"error": "not found"})
 # -- Lead tool dispatch (14 tools) --
 TOOL_HANDLERS = {
     "bash":              lambda **kw: _run_bash(kw["command"]),
@@ -483,7 +636,6 @@ TOOL_HANDLERS = {
     "idle":              lambda **kw: "Lead does not idle.",
     "claim_task":        lambda **kw: claim_task(kw["task_id"], "lead"),
 }
-
 # these base tools are unchanged from s02
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -515,8 +667,6 @@ TOOLS = [
     {"name": "claim_task", "description": "Claim a task from the board by ID.",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
 ]
-
-
 def agent_loop(messages: list):
     while True:
         inbox = BUS.read_inbox("lead")
@@ -525,39 +675,47 @@ def agent_loop(messages: list):
                 "role": "user",
                 "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
             })
-        response = client.messages.create(
+
+        # 关键请求点：主循环改为 OpenAI chat-completions。
+        response = client.chat.completions.create(
             model=MODEL,
-            system=SYSTEM,
-            messages=messages,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
             tools=TOOLS,
             max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+
+        assistant = response.choices[0].message
+        messages.append(_assistant_message_with_tool_calls(assistant))
+        if not assistant.tool_calls:
             return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
+
+        for call in assistant.tool_calls:
+            # 关键容错点：工具参数来自模型文本，先做 JSON 解析校验。
+            parsed_args, parse_error = _parse_tool_args(call.function.arguments)
+            if parse_error:
+                output = parse_error
+            else:
+                handler = TOOL_HANDLERS.get(call.function.name)
                 try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    output = handler(**parsed_args) if handler else f"Unknown tool: {call.function.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}:")
-                print(str(output)[:200])
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output),
-                })
-        messages.append({"role": "user", "content": results})
+
+            print(f"> {call.function.name}: {str(output)[:200]}")
+
+            # 关键回注点：工具结果注入 role=tool，并关联 tool_call_id。
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": str(output),
+            })
 
 
 if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms11 >> \033[0m")
+            query = input("\033[36ms17 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
@@ -578,9 +736,8 @@ if __name__ == "__main__":
             continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+
+        response_content = history[-1].get("content", "")
+        if isinstance(response_content, str) and response_content.strip():
+            print(response_content)
         print()

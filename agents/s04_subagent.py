@@ -23,20 +23,25 @@ context, sharing the filesystem, then returns only a summary to the parent.
 Key insight: "Process isolation gives context isolation for free."
 """
 
+import json
 import os
 import subprocess
 from pathlib import Path
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY is required")
+
+client = OpenAI(
+    api_key=api_key,
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
@@ -103,69 +108,183 @@ TOOL_HANDLERS = {
 
 # Child gets all base tools except task (no recursive spawning)
 CHILD_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact text in file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
 ]
 
 
 # -- Subagent: fresh context, filtered tools, summary-only return --
 def run_subagent(prompt: str) -> str:
     sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+    final_text = "(no summary)"
     for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
-            tools=CHILD_TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SUBAGENT_SYSTEM}] + sub_messages,
+            tools=CHILD_TOOLS,
+            max_tokens=8000,
         )
-        sub_messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        message = response.choices[0].message
+        print("\n\033[34m--- Subagent Response ---\033[0m")
+        print(message)
+        print("\033[34m--- End Subagent Response ---\033[0m\n")
+        assistant_message = {"role": "assistant", "content": message.content or ""}
+        if message.tool_calls:
+            assistant_message["tool_calls"] = [
+                {
+                    "id": tool_call.id,
+                    "type": tool_call.type,
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    },
+                }
+                for tool_call in message.tool_calls
+            ]
+        sub_messages.append(assistant_message)
+        if not message.tool_calls:
+            final_text = message.content or "(no summary)"
             break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
+        for tool_call in message.tool_calls:
+            name = tool_call.function.name
+            handler = TOOL_HANDLERS.get(name)
+            try:
+                tool_input = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as exc:
+                output = f"Error: invalid tool arguments: {exc}"
+            else:
+                output = handler(**tool_input) if handler else f"Unknown tool: {name}"
+            sub_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": str(output)[:50000],
+            })
     # Only the final text returns to the parent -- child context is discarded
-    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+    return final_text
 
 
 # -- Parent tools: base tools + task dispatcher --
 PARENT_TOOLS = CHILD_TOOLS + [
-    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
-     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "description": {"type": "string", "description": "Short description of the task"},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
 ]
 
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=PARENT_TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}] + messages,
+            tools=PARENT_TOOLS,
+            max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "task":
-                    desc = block.input.get("description", "subtask")
-                    prompt = block.input.get("prompt", "")
+        message = response.choices[0].message
+        print("\n\033[32m--- LLM Response ---\033[0m")
+        print(message)
+        print("\033[32m--- End Response ---\033[0m\n")
+        assistant_message = {"role": "assistant", "content": message.content or ""}
+        if message.tool_calls:
+            assistant_message["tool_calls"] = [
+                {
+                    "id": tool_call.id,
+                    "type": tool_call.type,
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    },
+                }
+                for tool_call in message.tool_calls
+            ]
+        messages.append(assistant_message)
+
+        if not message.tool_calls:
+            return message.content or ""
+
+        for tool_call in message.tool_calls:
+            name = tool_call.function.name
+            try:
+                tool_input = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as exc:
+                output = f"Error: invalid tool arguments: {exc}"
+                name = "invalid_args"
+            else:
+                if name == "task":
+                    desc = tool_input.get("description", "subtask")
+                    prompt = tool_input.get("prompt", "")
                     print(f"> task ({desc}): {prompt[:80]}")
                     output = run_subagent(prompt)
                 else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+                    handler = TOOL_HANDLERS.get(name)
+                    output = handler(**tool_input) if handler else f"Unknown tool: {name}"
+            print(f"  {str(output)[:200]}")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": str(output),
+            })
 
 
 if __name__ == "__main__":
@@ -178,10 +297,7 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
-        agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        response_text = agent_loop(history)
+        if response_text:
+            print(response_text)
         print()

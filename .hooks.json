@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "command": "echo '{\"additionalContext\":\"Hook system is active for this session.\"}'"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "bash",
+        "command": "if echo \"$HOOK_TOOL_INPUT\" | grep -Eq 'rm -rf /|\\\"command\\\"\\s*:\\s*\\\"sudo '; then echo 'Blocked by hook policy: high-risk bash command.' >&2; exit 1; fi; exit 0"
+      },
+      {
+        "matcher": "bash",
+        "command": "if echo \"$HOOK_TOOL_INPUT\" | grep -Eq '\\\"command\\\"\\s*:\\s*\\\"(pytest|npm test|uv run pytest)'; then echo 'Hook hint: this test command may take a while.' >&2; exit 2; fi; exit 0"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "command": "echo \"[hook-log] $HOOK_TOOL_NAME finished\""
+      }
+    ]
+  }
+}
