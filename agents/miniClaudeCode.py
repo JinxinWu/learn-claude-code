@@ -3,8 +3,8 @@
 """
 miniClaudeCode.py - Full Reference Agent
 
-Capstone implementation combining every mechanism from s01-s11.
-Session s12 (task-aware worktree isolation) is taught separately.
+Capstone implementation combining core mechanisms plus later integrations.
+Task system is aligned to s12, background tasks to s13, and team to s15.
 NOT a teaching session -- this is the "put it all together" reference.
 
     +------------------------------------------------------------------+
@@ -14,8 +14,8 @@ NOT a teaching session -- this is the "put it all together" reference.
     |                                                                   |
     |  Before each LLM call:                                            |
     |  +--------------------+  +------------------+  +--------------+  |
-    |  | Microcompact (s06) |  | Drain bg (s08)   |  | Check inbox  |  |
-    |  | Auto-compact (s06) |  | notifications    |  | (s09)        |  |
+    |  | Microcompact (s06) |  | Drain bg (s13)   |  | Check inbox  |  |
+    |  | Auto-compact (s06) |  | notifications    |  | (s15)        |  |
     |  +--------------------+  +------------------+  +--------------+  |
     |                                                                   |
     |  Tool dispatch (s02 pattern):                                     |
@@ -28,7 +28,7 @@ NOT a teaching session -- this is the "put it all together" reference.
     |  +--------+----------+----------+---------+-----------+          |
     |                                                                   |
     |  Subagent (s04):  spawn -> work -> return summary                 |
-    |  Teammate (s09):  spawn -> work -> idle -> auto-claim (s11)      |
+    |  Teammate (s15):  spawn -> work -> idle -> auto-claim (s11)      |
     |  Shutdown (s10):  request_id handshake                            |
     |  Plan gate (s10): submit -> approve/reject                        |
     +------------------------------------------------------------------+
@@ -402,7 +402,7 @@ def auto_compact(messages: list) -> list:
     ]
 
 
-# === SECTION: file_tasks (s07) ===
+# === SECTION: tasks_system (s12) ===
 class TaskManager:
     def __init__(self):
         TASKS_DIR.mkdir(exist_ok=True)
@@ -468,7 +468,7 @@ class TaskManager:
         return f"Claimed task #{tid} for {owner}"
 
 
-# === SECTION: background (s08) ===
+# === SECTION: background_tasks (s13) ===
 class BackgroundManager:
     def __init__(self):
         self.tasks = {}
@@ -539,7 +539,7 @@ shutdown_requests = {}
 plan_requests = {}
 
 
-# === SECTION: team (s09/s11) ===
+# === SECTION: team (s15) ===
 class TeammateManager:
     def __init__(self, bus: MessageBus, task_mgr: TaskManager):
         TEAM_DIR.mkdir(exist_ok=True)
@@ -1081,12 +1081,12 @@ def agent_loop(messages: list) -> str:
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
             print("[auto-compact triggered]")
             messages[:] = auto_compact(messages)
-        # s08: drain background notifications
+        # s13: drain background notifications
         notifs = BG.drain()
         if notifs:
             txt = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
             messages.append({"role": "user", "content": f"<background-results>\n{txt}\n</background-results>"})
-        # s10: check lead inbox
+        # s15: check lead inbox
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({"role": "user", "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"})

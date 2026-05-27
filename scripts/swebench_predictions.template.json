@@ -1,0 +1,7 @@
+[
+  {
+    "instance_id": "astropy__astropy-12907",
+    "model_name_or_path": "miniClaudeCode",
+    "model_patch": "diff --git a/path/to/file.py b/path/to/file.py\nindex 0000000..1111111 100644\n--- a/path/to/file.py\n+++ b/path/to/file.py\n@@ -1,1 +1,1 @@\n-old_line\n+new_line\n"
+  }
+]
